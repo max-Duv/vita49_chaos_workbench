@@ -17,6 +17,51 @@ import numpy as np
 from vita49 import build_demo_packet
 
 
+_TSHARK_PAYLOAD_FIELD = None
+
+def tshark_payload_field():
+    """Choose a raw UDP payload field supported by the installed tshark.
+
+    Newer Wireshark exposes ``udp.payload``.  Older RHEL/Wireshark builds do
+    not, but the generic ``data.data`` byte-sequence field has existed for
+    many years.  Detect once at runtime so the same workbench works on both.
+    Set VITA_TSHARK_PAYLOAD_FIELD to override detection if a site-specific
+    dissector exposes a different byte field.
+    """
+    global _TSHARK_PAYLOAD_FIELD
+    override = os.environ.get("VITA_TSHARK_PAYLOAD_FIELD", "").strip()
+    if override:
+        return override
+    if _TSHARK_PAYLOAD_FIELD:
+        return _TSHARK_PAYLOAD_FIELD
+    if shutil.which("tshark") is None:
+        raise RuntimeError("tshark not found")
+    try:
+        out = subprocess.check_output(
+            ["tshark", "-G", "fields"],
+            universal_newlines=True, stderr=subprocess.STDOUT)
+    except Exception as e:
+        raise RuntimeError("could not query tshark fields: %s" % e)
+    names = set()
+    for line in out.splitlines():
+        cols = line.split("\t")
+        # -G fields rows normally put the filter name in column 3.  Also scan
+        # all columns to tolerate older output layouts.
+        for col in cols:
+            if col in ("udp.payload", "data.data"):
+                names.add(col)
+    if "udp.payload" in names:
+        _TSHARK_PAYLOAD_FIELD = "udp.payload"
+    elif "data.data" in names:
+        _TSHARK_PAYLOAD_FIELD = "data.data"
+    else:
+        raise RuntimeError(
+            "installed tshark exposes neither udp.payload nor data.data; "
+            "run 'tshark -G fields | grep -Ei \"udp\.payload|data\.data|vita|vrt\"' "
+            "and set VITA_TSHARK_PAYLOAD_FIELD to a supported raw byte field")
+    return _TSHARK_PAYLOAD_FIELD
+
+
 @dataclass
 class PacketEvent:
     raw: bytes
@@ -200,7 +245,7 @@ class TsharkLiveSource:
             "-o", "ip.defragment:TRUE",
             "-Y", "ip.dst==%s && udp.dstport==%d" % (self.group, self.port),
             "-T", "fields", "-E", "separator=|", "-E", "occurrence=f",
-            "-e", "frame.time_epoch", "-e", "udp.payload",
+            "-e", "frame.time_epoch", "-e", tshark_payload_field(),
         ]
         return cmd
 
@@ -280,6 +325,7 @@ class TsharkLiveSource:
             "interface": self.interface,
             "rx_packets": self.rx_packets,
             "rx_bytes": self.rx_bytes,
+            "payload_field": tshark_payload_field(),
             "note": "capture filter is group-only so fragmented UDP can be reassembled",
         }
 
@@ -385,7 +431,7 @@ class PcapSource:
         if display:
             cmd += ["-Y", " && ".join(display)]
         cmd += ["-T", "fields", "-E", "separator=|", "-E", "occurrence=f",
-                "-e", "frame.time_epoch", "-e", "udp.payload"]
+                "-e", "frame.time_epoch", "-e", tshark_payload_field()]
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      universal_newlines=True, bufsize=1)
 
